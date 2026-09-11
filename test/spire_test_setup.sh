@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =============================================================================
-# start-spire.sh
+# spire_test_setup.sh
 #
 # Starts the Admin SPIRE Server + Agent (admin.app) and two federated test
 # servers + agents (domain-a.test, domain-b.test), all using https_web for
@@ -10,74 +10,210 @@ set -euo pipefail
 #
 # A shared local CA is generated once and referenced directly in each server's
 # TLS config — no system trust store modification required.
-#
-# Usage:
-#   ./start-spire.sh <data_directory_path> [OPTIONS]
-#
-# Options:
-#   --admin-server-port   Admin server gRPC port        (default: 8081)
-#   --admin-bundle-port   Admin bundle endpoint port    (default: 8445)
-#   --server-port-a       Server A gRPC port            (default: 8082)
-#   --server-port-b       Server B gRPC port            (default: 8083)
-#   --bundle-port-a       Server A bundle endpoint port (default: 8446)
-#   --bundle-port-b       Server B bundle endpoint port (default: 8447)
 # =============================================================================
 
-# ── Validate required positional arg ─────────────────────────────────────────
-
-if [ -z "${1:-}" ]; then
-    echo "Usage: $0 <data_directory_path> [OPTIONS]"
-    exit 1
-fi
-
-DATA_ROOT="$1"
-shift
+SCRIPT_NAME="$(basename "$0")"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
+DATA_ROOT=""
 ADMIN_SERVER_PORT=8081
 ADMIN_BUNDLE_PORT=8445
-SERVER_PORT_A=8082
-SERVER_PORT_B=8083
-BUNDLE_PORT_A=8446
-BUNDLE_PORT_B=8447
+DOMAIN_A_SERVER_PORT=8082
+DOMAIN_B_SERVER_PORT=8083
+DOMAIN_A_BUNDLE_PORT=8446
+DOMAIN_B_BUNDLE_PORT=8447
+CLEAN_ONLY=false
 
-# ── Argument parsing ──────────────────────────────────────────────────────────
+# ── Help / Usage ─────────────────────────────────────────────────────────────
+
+print_help() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME [DATA_DIRECTORY] [OPTIONS]
+  $SCRIPT_NAME -d <DATA_DIRECTORY> [OPTIONS]
+
+Starts a local multi-domain SPIRE testing environment with an Admin Server/Agent
+(admin.app) and two federated servers/agents (domain-a.test and domain-b.test).
+
+Arguments:
+  DATA_DIRECTORY                   Path to the directory where runtime configs,
+                                   databases, and socket files will be stored.
+                                   Can be specified positionally or via -d/--data-dir.
+
+Options:
+  -d, --data-dir <path>            Directory path for test data and sockets
+  --admin-server-port <port>       Admin server gRPC port         (default: 8081)
+  --admin-bundle-port <port>       Admin bundle endpoint port     (default: 8445)
+  --domain-a-server-port <port>    Domain A server gRPC port      (default: 8082)
+  --domain-b-server-port <port>    Domain B server gRPC port      (default: 8083)
+  --domain-a-bundle-port <port>    Domain A bundle endpoint port  (default: 8446)
+  --domain-b-bundle-port <port>    Domain B bundle endpoint port  (default: 8447)
+  -c, --clean                      Clean up existing test data & processes and exit
+  -h, --help                       Display this help message and exit
+
+Examples:
+  # Start with default ports using positional data directory
+  $SCRIPT_NAME /tmp/spire-data
+
+  # Start with custom data directory and custom Admin port
+  $SCRIPT_NAME --data-dir /tmp/spire-data --admin-server-port 9081
+
+  # Customize federated domain ports
+  $SCRIPT_NAME /tmp/spire-data --domain-a-server-port 8182 --domain-b-server-port 8183
+
+  # Clean up test environment data and running SPIRE instances
+  $SCRIPT_NAME -d /tmp/spire-data --clean
+EOF
+}
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+validate_port() {
+  local port_val="$1"
+  local port_name="$2"
+  if ! [[ "$port_val" =~ ^[0-9]+$ ]] || [ "$port_val" -lt 1024 ] || [ "$port_val" -gt 65535 ]; then
+    die "Invalid value for ${port_name}: '${port_val}'. Must be an integer between 1024 and 65535."
+  fi
+}
+
+# ── Argument Parsing ──────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --admin-server-port) ADMIN_SERVER_PORT="$2"; shift 2 ;;
-    --admin-bundle-port) ADMIN_BUNDLE_PORT="$2"; shift 2 ;;
-    --server-port-a)     SERVER_PORT_A="$2";     shift 2 ;;
-    --server-port-b)     SERVER_PORT_B="$2";     shift 2 ;;
-    --bundle-port-a)     BUNDLE_PORT_A="$2";     shift 2 ;;
-    --bundle-port-b)     BUNDLE_PORT_B="$2";     shift 2 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    -d|--data-dir)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a directory path argument."
+      fi
+      DATA_ROOT="$2"
+      shift 2
+      ;;
+    --admin-server-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      ADMIN_SERVER_PORT="$2"
+      shift 2
+      ;;
+    --admin-bundle-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      ADMIN_BUNDLE_PORT="$2"
+      shift 2
+      ;;
+    --domain-a-server-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      DOMAIN_A_SERVER_PORT="$2"
+      shift 2
+      ;;
+    --domain-b-server-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      DOMAIN_B_SERVER_PORT="$2"
+      shift 2
+      ;;
+    --domain-a-bundle-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      DOMAIN_A_BUNDLE_PORT="$2"
+      shift 2
+      ;;
+    --domain-b-bundle-port)
+      if [[ -z "${2:-}" || "$2" == -* ]]; then
+        die "Option '$1' requires a port argument."
+      fi
+      DOMAIN_B_BUNDLE_PORT="$2"
+      shift 2
+      ;;
+    -c|--clean)
+      CLEAN_ONLY=true
+      shift 1
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      echo "Run '$SCRIPT_NAME --help' for usage." >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$DATA_ROOT" ]]; then
+        DATA_ROOT="$1"
+        shift 1
+      else
+        die "Unexpected positional argument: '$1'. Data directory already set to '$DATA_ROOT'."
+      fi
+      ;;
   esac
+done
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+if [[ -z "$DATA_ROOT" ]]; then
+  echo "Error: Data directory path is required." >&2
+  echo "Run '$SCRIPT_NAME --help' for usage." >&2
+  exit 1
+fi
+
+validate_port "$ADMIN_SERVER_PORT"   "--admin-server-port"
+validate_port "$ADMIN_BUNDLE_PORT"   "--admin-bundle-port"
+validate_port "$DOMAIN_A_SERVER_PORT" "--domain-a-server-port"
+validate_port "$DOMAIN_B_SERVER_PORT" "--domain-b-server-port"
+validate_port "$DOMAIN_A_BUNDLE_PORT" "--domain-a-bundle-port"
+validate_port "$DOMAIN_B_BUNDLE_PORT" "--domain-b-bundle-port"
+
+# Check for duplicate port assignments
+declare -A PORT_MAP
+for p in "$ADMIN_SERVER_PORT:admin-server" \
+         "$ADMIN_BUNDLE_PORT:admin-bundle" \
+         "$DOMAIN_A_SERVER_PORT:domain-a-server" \
+         "$DOMAIN_B_SERVER_PORT:domain-b-server" \
+         "$DOMAIN_A_BUNDLE_PORT:domain-a-bundle" \
+         "$DOMAIN_B_BUNDLE_PORT:domain-b-bundle"; do
+  port="${p%%:*}"
+  service="${p##*:}"
+  if [[ -n "${PORT_MAP[$port]:-}" ]]; then
+    die "Port collision detected: port $port is assigned to both '${PORT_MAP[$port]}' and '$service'."
+  fi
+  PORT_MAP["$port"]="$service"
 done
 
 # ── Derived paths ─────────────────────────────────────────────────────────────
 
+# Convert DATA_ROOT to absolute path if relative
+if [[ ! "$DATA_ROOT" = /* ]]; then
+  DATA_ROOT="$(pwd)/$DATA_ROOT"
+fi
+
 ADMIN_DIR="${DATA_ROOT}/spire-admin"
 TEST_DIR="${DATA_ROOT}/spire-test-servers"
 BUNDLES_DIR="${TEST_DIR}/trust_bundles"
-
-# Ensure all paths are absolute
-for var in ADMIN_DIR TEST_DIR BUNDLES_DIR; do
-  val="${!var}"
-  if [[ ! "$val" = /* ]]; then
-    printf -v "$var" '%s/%s' "$(pwd)" "$val"
-  fi
-done
-
 ADMIN_SOCK="${ADMIN_DIR}/server.sock"
+
+# ── Clean-Only Handling ───────────────────────────────────────────────────────
+
+if [ "$CLEAN_ONLY" = true ]; then
+  log "Stopping any running SPIRE processes..."
+  killall spire-server spire-agent 2>/dev/null || true
+  log "Removing data directory: ${DATA_ROOT}"
+  rm -rf "${ADMIN_DIR}" "${TEST_DIR}"
+  log "Cleanup complete."
+  exit 0
+fi
 
 # =============================================================================
 # SHARED HELPERS
 # =============================================================================
-
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-die() { echo "[ERROR] $*" >&2; exit 1; }
 
 check_deps() {
   command -v spire-server &>/dev/null || die "spire-server not found in PATH"
@@ -126,13 +262,13 @@ server {
             port = ${ADMIN_BUNDLE_PORT}
         }
         federates_with "domain-a.test" {
-            bundle_endpoint_url = "https://127.0.0.1:${BUNDLE_PORT_A}"
+            bundle_endpoint_url = "https://127.0.0.1:${DOMAIN_A_BUNDLE_PORT}"
             bundle_endpoint_profile "https_spiffe" {
                 endpoint_spiffe_id = "spiffe://domain-a.test/spire/server"
             }
         }
         federates_with "domain-b.test" {
-            bundle_endpoint_url = "https://127.0.0.1:${BUNDLE_PORT_B}"
+            bundle_endpoint_url = "https://127.0.0.1:${DOMAIN_B_BUNDLE_PORT}"
             bundle_endpoint_profile "https_spiffe" {
                 endpoint_spiffe_id = "spiffe://domain-b.test/spire/server"
             }
@@ -199,8 +335,6 @@ start_admin_agent() {
     -joinToken "$token" \
     > "${ADMIN_DIR}/admin-agent.log" 2>&1 &
 }
-
-
 
 # =============================================================================
 # TEST — domain-a.test + domain-b.test servers and agents
@@ -290,7 +424,6 @@ generate_trust_bundle() {
     > "${BUNDLES_DIR}/test-server-b.pem"
   spire-server bundle show -socketPath "${ADMIN_SOCK}" \
     > "${BUNDLES_DIR}/admin-server.pem"
-
 }
 
 bootstrap_federation() {
@@ -367,15 +500,15 @@ setup_admin_agent() {
 
 setup_test_server() {
   log "=== Setting up Test Servers (domain-a.test, domain-b.test) ==="
-  write_test_server_config "a" "${SERVER_PORT_A}" "${BUNDLE_PORT_A}"
-  write_test_server_config "b" "${SERVER_PORT_B}" "${BUNDLE_PORT_B}"
+  write_test_server_config "a" "${DOMAIN_A_SERVER_PORT}" "${DOMAIN_A_BUNDLE_PORT}"
+  write_test_server_config "b" "${DOMAIN_B_SERVER_PORT}" "${DOMAIN_B_BUNDLE_PORT}"
   start_test_servers
 }
 
 setup_test_agents() {
   log "=== Setting up Test Agents (domain-a.test, domain-b.test) ==="
-  write_test_agent_config  "a" "${SERVER_PORT_A}"
-  write_test_agent_config  "b" "${SERVER_PORT_B}"
+  write_test_agent_config  "a" "${DOMAIN_A_SERVER_PORT}"
+  write_test_agent_config  "b" "${DOMAIN_B_SERVER_PORT}"
   start_test_agents
 }
 
@@ -396,15 +529,15 @@ print_summary() {
   echo "                     ${ADMIN_DIR}/admin-agent.log"
   echo ""
   echo "  Server A (domain-a.test)"
-  echo "    gRPC:            127.0.0.1:${SERVER_PORT_A}"
-  echo "    Bundle endpoint: https://127.0.0.1:${BUNDLE_PORT_A}  (https_web)"
+  echo "    gRPC:            127.0.0.1:${DOMAIN_A_SERVER_PORT}"
+  echo "    Bundle endpoint: https://127.0.0.1:${DOMAIN_A_BUNDLE_PORT}  (https_web)"
   echo "    Workload:        spiffe://domain-a.test/workload-a"
   echo "    Logs:            ${TEST_DIR}/test-server-a.log"
   echo "                     ${TEST_DIR}/test-agent-a.log"
   echo ""
   echo "  Server B (domain-b.test)"
-  echo "    gRPC:            127.0.0.1:${SERVER_PORT_B}"
-  echo "    Bundle endpoint: https://127.0.0.1:${BUNDLE_PORT_B}  (https_web)"
+  echo "    gRPC:            127.0.0.1:${DOMAIN_B_SERVER_PORT}"
+  echo "    Bundle endpoint: https://127.0.0.1:${DOMAIN_B_BUNDLE_PORT}  (https_web)"
   echo "    Workload:        spiffe://domain-b.test/workload-b"
   echo "    Logs:            ${TEST_DIR}/test-server-b.log"
   echo "                     ${TEST_DIR}/test-agent-b.log"
